@@ -222,3 +222,4 @@ __marimo__/
 *.zip
 # *.pkl
 output
+plots

@@ -38,13 +38,13 @@ import pynapple as nap
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_LFP_RATE = 500.0
+DEFAULT_PLOT_PATH = Path(__file__).resolve().parents[1] / "plots"
 
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class CON2PHYSSession:
     """The Pynapple objects and accompanying unit/trial metadata for a subject."""
 
-    subject: int
+    subject: int = 1
     lfp: dict[int, nap.TsdFrame]
     spikes: nap.TsGroup | None
     trials: nap.IntervalSet

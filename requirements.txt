@@ -1,3 +1,4 @@
 numpy>=1.24
 pandas>=2.0
-pynapple>=0.8
+pynapple>=0.11.1
+scipy>=1.10

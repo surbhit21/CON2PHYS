@@ -9,7 +9,13 @@ import pandas as pd
 import pynapple as nap
 import pytest
 
-from src import available_subjects, load_con2phys, load_session
+from src import (
+    available_subjects,
+    firing_rate_by_brain_area,
+    load_con2phys,
+    load_session,
+)
+from src.data_loader import DEFAULT_DATA_PATH
 
 from .conftest import SUBJECT
 
@@ -102,3 +108,70 @@ def test_rejects_invalid_options(
 def test_reports_missing_subject(consortium_data: Path) -> None:
     with pytest.raises(ValueError, match="subject 99"):
         load_session(99, consortium_data, lfp_banks=(), load_spikes=False)
+
+
+def test_firing_rate_by_brain_area(consortium_data: Path) -> None:
+    session = load_session(SUBJECT, consortium_data, lfp_banks=())
+    assert session.spikes is not None
+
+    rates = firing_rate_by_brain_area(session.spikes)
+
+    assert rates.index.tolist() == [1, 3]
+    assert rates["n_units"].tolist() == [1, 1]
+    assert rates["n_spikes"].tolist() == [2, 2]
+    np.testing.assert_allclose(rates["duration_s"], 1.3)
+    np.testing.assert_allclose(rates["population_firing_rate_hz"], 2 / 1.3)
+    np.testing.assert_allclose(rates["mean_unit_firing_rate_hz"], 2 / 1.3)
+
+
+def test_firing_rate_can_be_restricted_to_epoch(consortium_data: Path) -> None:
+    session = load_session(SUBJECT, consortium_data, lfp_banks=())
+    assert session.spikes is not None
+    epoch = nap.IntervalSet(start=[0.1], end=[1.0], time_units="s")
+
+    rates = firing_rate_by_brain_area(session.spikes, epoch)
+
+    assert rates["n_spikes"].tolist() == [1, 1]
+    np.testing.assert_allclose(rates["duration_s"], 0.9)
+    np.testing.assert_allclose(rates["mean_unit_firing_rate_hz"], 1 / 0.9)
+
+
+def test_firing_rate_requires_brain_area_metadata() -> None:
+    spikes = nap.TsGroup({1: nap.Ts(t=[0.1, 0.2])})
+
+    with pytest.raises(ValueError, match="brain_area"):
+        firing_rate_by_brain_area(spikes)
+
+
+@pytest.mark.integration
+def test_participant_1_firing_rates_match_reference_data() -> None:
+    """Check participant 1 against rates calculated from the consortium release."""
+    archive = DEFAULT_DATA_PATH / "py-files.zip"
+    if not archive.is_file():
+        pytest.skip("the consortium data archive is not available")
+
+    session = load_session(
+        subject=1,
+        data_path=DEFAULT_DATA_PATH,
+        lfp_banks=(),
+    )
+    assert session.spikes is not None
+    rates = firing_rate_by_brain_area(session.spikes)
+
+    expected_hz = pd.Series(
+        {
+            1: 9.31268669,
+            2: 5.69492681,
+            3: 11.35885574,
+        },
+        name="mean_unit_firing_rate_hz",
+    ).rename_axis("brain_area")
+    actual_hz = rates["mean_unit_firing_rate_hz"].sort_index()
+
+    pd.testing.assert_series_equal(
+        actual_hz,
+        expected_hz,
+        check_exact=False,
+        rtol=1e-7,
+        atol=1e-8,
+    )
