@@ -217,9 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-./data
+data/
 .DS_Store
 *.zip
 # *.pkl
 output
 plots
+analysis/
+data

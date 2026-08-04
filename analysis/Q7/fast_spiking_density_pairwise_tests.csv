@@ -1,3 +1,0 @@
-highest_area,comparison_area,n_participants,wilcoxon_statistic,p_value_one_sided,p_value_holm,significant_0.05
-3,1,18,161.0,0.000164031982421875,0.00032806396484375,True
-3,2,18,154.0,0.000789642333984375,0.000789642333984375,True

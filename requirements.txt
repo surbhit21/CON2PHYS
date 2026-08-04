@@ -36,6 +36,7 @@ ruamel.yaml==0.19.1
 scipy==1.15.3
 six==1.17.0
 tabulate==0.10.0
+tensorly==0.9.0
 tomli==2.4.1
 typing_extensions==4.16.0
 tzdata==2026.3
