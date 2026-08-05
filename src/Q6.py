@@ -35,6 +35,7 @@ if __package__:
         available_subjects,
         load_session,
     )
+    from .stat_test import holm_adjust
 else:
     from data_loader import (
         CON2PHYSSession,
@@ -43,6 +44,7 @@ else:
         available_subjects,
         load_session,
     )
+    from stat_test import holm_adjust
 
 
 PARTICIPANT = 1
@@ -53,6 +55,12 @@ DEFAULT_COUPLING_PLOT = DEFAULT_PLOT_PATH / "Q6" / "inter_region_coupling.png"
 DEFAULT_COUPLING_HISTOGRAM = (
     DEFAULT_PLOT_PATH / "Q6" / "coupling_strength_histogram.png"
 )
+DEFAULT_REGION_PAIRS = ((3, 2), (3, 1), (1, 2))
+
+
+def region_pair_name(source_area: object, target_area: object) -> str:
+    """Return the directory name used to keep directed-pair runs separate."""
+    return f"source_{source_area}_to_target_{target_area}"
 
 
 @dataclass(frozen=True)
@@ -701,8 +709,15 @@ def run_all_participants(
         output_root / "all_participants_glm_model_scores.csv", index=False
     )
     participant_summary = (
-        combined_connectivity.groupby("participant", as_index=False)["summed_coefficient"]
-        .agg(n_source_target_pairs="count", mean_coupling_strength="mean")
+        combined_connectivity.assign(
+            absolute_coupling_strength=lambda frame: frame["summed_coefficient"].abs()
+        )
+        .groupby("participant", as_index=False)
+        .agg(
+            n_source_target_pairs=("summed_coefficient", "count"),
+            mean_signed_coupling=("summed_coefficient", "mean"),
+            mean_absolute_coupling_strength=("absolute_coupling_strength", "mean"),
+        )
     )
     participant_summary.to_csv(
         output_root / "coupling_strength_by_participant.csv", index=False
@@ -721,6 +736,113 @@ def run_all_participants(
     return status_table
 
 
+def compare_coupling_across_region_pairs(
+    output_root: str | Path = Path("analysis/Q6"),
+    *,
+    pairs: Iterable[tuple[object, object]] = DEFAULT_REGION_PAIRS,
+) -> tuple[pd.DataFrame, pd.DataFrame, object]:
+    """Compare absolute coupling magnitudes across directed region pairs.
+
+    Each observation is one participant's mean absolute lag-summed coupling
+    across its source-target neuron pairs. A Friedman test compares all
+    directions; the highest-mean direction is then tested against the others
+    with one-sided paired Wilcoxon tests and Holm correction.
+    """
+    root = Path(output_root)
+    participant_frames: list[pd.DataFrame] = []
+    pair_list = list(pairs)
+    if len(pair_list) < 3:
+        raise ValueError("at least three directed region pairs are required")
+    for source_area, target_area in pair_list:
+        label = region_pair_name(source_area, target_area)
+        path = root / label / "all_participants_source_target_connectivity.csv"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"missing {path}; run Q6 for source {source_area} -> target {target_area}"
+            )
+        connectivity = pd.read_csv(path)
+        required = {"participant", "summed_coefficient"}
+        missing = required.difference(connectivity.columns)
+        if missing:
+            raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+        participant_mean = (
+            connectivity.assign(
+                absolute_coupling_strength=connectivity["summed_coefficient"].abs()
+            )
+            .groupby("participant", as_index=False)
+            .agg(
+                n_source_target_pairs=("summed_coefficient", "count"),
+                mean_signed_coupling=("summed_coefficient", "mean"),
+                mean_absolute_coupling_strength=("absolute_coupling_strength", "mean"),
+            )
+        )
+        participant_mean.insert(1, "directed_pair", label)
+        participant_mean.insert(2, "source_area", source_area)
+        participant_mean.insert(3, "target_area", target_area)
+        participant_frames.append(participant_mean)
+    participant_table = pd.concat(participant_frames, ignore_index=True)
+
+    grouped = participant_table.groupby("directed_pair")[
+        "mean_absolute_coupling_strength"
+    ]
+    summary = grouped.agg(n_participants="count", mean_coupling="mean", sd="std")
+    summary["sem"] = summary["sd"] / np.sqrt(summary["n_participants"])
+    critical = summary["n_participants"].map(
+        lambda n: stats.t.ppf(0.975, n - 1) if n > 1 else np.nan
+    )
+    margin = critical * summary["sem"]
+    summary["ci95_low"] = summary["mean_coupling"] - margin
+    summary["ci95_high"] = summary["mean_coupling"] + margin
+    highest_pair = summary["mean_coupling"].idxmax()
+
+    complete = participant_table.pivot(
+        index="participant",
+        columns="directed_pair",
+        values="mean_absolute_coupling_strength",
+    ).dropna()
+    if complete.shape[0] < 2:
+        raise ValueError("at least two participants with all pair fits are required")
+    friedman = stats.friedmanchisquare(
+        *(complete[label].to_numpy() for label in complete.columns)
+    )
+    comparisons: list[dict[str, object]] = []
+    raw_p_values: list[float] = []
+    for other_pair in complete.columns:
+        if other_pair == highest_pair:
+            continue
+        test = stats.wilcoxon(
+            complete[highest_pair], complete[other_pair], alternative="greater"
+        )
+        raw_p_values.append(float(test.pvalue))
+        comparisons.append(
+            {
+                "highest_pair": highest_pair,
+                "comparison_pair": other_pair,
+                "n_complete_participants": len(complete),
+                "wilcoxon_statistic": float(test.statistic),
+                "p_value_one_sided": float(test.pvalue),
+            }
+        )
+    for comparison, adjusted in zip(comparisons, holm_adjust(raw_p_values)):
+        comparison["p_value_holm"] = adjusted
+        comparison["significant_0.05"] = adjusted < 0.05
+    pairwise = pd.DataFrame(comparisons)
+
+    root.mkdir(parents=True, exist_ok=True)
+    participant_table.to_csv(root / "region_pair_coupling_by_participant.csv", index=False)
+    summary.to_csv(root / "region_pair_coupling_group_summary.csv")
+    pairwise.to_csv(root / "region_pair_coupling_pairwise_tests.csv", index=False)
+    pd.DataFrame(
+        [{
+            "n_complete_participants": len(complete),
+            "friedman_statistic": float(friedman.statistic),
+            "p_value": float(friedman.pvalue),
+            "highest_mean_pair": highest_pair,
+        }]
+    ).to_csv(root / "region_pair_coupling_friedman_test.csv", index=False)
+    return summary, pairwise, friedman
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--participant", type=int, default=PARTICIPANT)
@@ -728,6 +850,11 @@ def main() -> None:
         "--all-participants",
         action="store_true",
         help="analyze every participant sequentially",
+    )
+    parser.add_argument(
+        "--compare-pairs",
+        action="store_true",
+        help="compare completed 3->2, 3->1, and 1->2 all-participant runs",
     )
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--source-area", type=int, default=1)
@@ -742,6 +869,24 @@ def main() -> None:
         "--histogram", type=Path, default=DEFAULT_COUPLING_HISTOGRAM
     )
     args = parser.parse_args()
+    if args.compare_pairs:
+        summary, pairwise, friedman = compare_coupling_across_region_pairs(
+            args.output_dir
+        )
+        highest = summary["mean_coupling"].idxmax()
+        print("Mean absolute coupling strength and 95% CI")
+        print(summary.to_string(float_format=lambda value: f"{value:.6g}"))
+        print(
+            f"\nFriedman test: chi-square={friedman.statistic:.6g}, "
+            f"p={friedman.pvalue:.6g}"
+        )
+        print(f"Highest mean coupling: {highest}")
+        print("\nHolm-corrected paired comparisons")
+        print(pairwise.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+        return
+    pair_directory = region_pair_name(args.source_area, args.target_area)
+    pair_output = args.output_dir / pair_directory
+    pair_plots = args.plot.parent / pair_directory
     if args.all_participants:
         if args.target_unit:
             parser.error("--target-unit cannot be combined with --all-participants")
@@ -749,24 +894,24 @@ def main() -> None:
             source_area=args.source_area,
             target_area=args.target_area,
             data_path=args.data_path,
-            output_root=args.output_dir,
-            plot_root=args.plot.parent,
+            output_root=pair_output,
+            plot_root=pair_plots,
             ridge=args.ridge,
             test_fraction=args.test_fraction,
             max_iter=args.max_iter,
         )
         completed = int(statuses["status"].eq("completed").sum())
         print(f"Completed {completed} of {len(statuses)} participants")
-        print(f"Combined results: {args.output_dir.resolve()}")
-        print(f"Plots: {args.plot.parent.resolve()}")
+        print(f"Combined results: {pair_output.resolve()}")
+        print(f"Plots: {pair_plots.resolve()}")
     else:
         result = run_participant_analysis(
             args.participant,
             source_area=args.source_area,
             target_area=args.target_area,
             data_path=args.data_path,
-            output_dir=args.output_dir,
-            plot_dir=args.plot.parent,
+            output_dir=pair_output,
+            plot_dir=pair_plots,
             ridge=args.ridge,
             test_fraction=args.test_fraction,
             max_iter=args.max_iter,
@@ -778,8 +923,8 @@ def main() -> None:
         if args.histogram != DEFAULT_COUPLING_HISTOGRAM:
             plot_coupling_strength_histogram(result, args.histogram, bins=20)
         print(f"Fitted {len(result.model_scores)} target-neuron GLMs")
-        print(f"Results: {args.output_dir.resolve()}")
-        print(f"Plots: {args.plot.parent.resolve()}")
+        print(f"Results: {pair_output.resolve()}")
+        print(f"Plots: {pair_plots.resolve()}")
 
 
 if __name__ == "__main__":

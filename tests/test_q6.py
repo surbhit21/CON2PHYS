@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from src.Q6 import (
     build_glm_design,
+    compare_coupling_across_region_pairs,
     fit_connectivity_glms,
     plot_coupling_strength_histogram,
     plot_inter_region_coupling,
     run_all_participants,
+    region_pair_name,
     summarize_coupling_strengths,
 )
 from src.data_loader import load_session
@@ -93,8 +96,6 @@ def test_all_participants_runner_writes_combined_outputs(consortium_data, tmp_pa
 
 
 def test_coupling_summary_uses_participant_means() -> None:
-    import pandas as pd
-
     connectivity = pd.DataFrame(
         {
             "participant": [1, 1, 2, 2],
@@ -108,3 +109,31 @@ def test_coupling_summary_uses_participant_means() -> None:
     assert summary["n"] == 2
     assert summary["mean_coupling_strength"] == 2.0
     assert summary["ci_low"] < 2.0 < summary["ci_high"]
+
+
+def test_compare_directed_region_pairs_uses_participant_means(tmp_path) -> None:
+    pairs = [(3, 2), (3, 1), (1, 2)]
+    bases = {(3, 2): 0.30, (3, 1): 0.10, (1, 2): 0.20}
+    for pair in pairs:
+        path = tmp_path / region_pair_name(*pair)
+        path.mkdir()
+        rows = []
+        for participant in range(1, 9):
+            value = bases[pair] + participant * 0.001
+            rows.extend(
+                [
+                    {"participant": participant, "summed_coefficient": value},
+                    {"participant": participant, "summed_coefficient": -value},
+                ]
+            )
+        pd.DataFrame(rows).to_csv(
+            path / "all_participants_source_target_connectivity.csv", index=False
+        )
+
+    summary, pairwise, friedman = compare_coupling_across_region_pairs(
+        tmp_path, pairs=pairs
+    )
+    assert summary["mean_coupling"].idxmax() == "source_3_to_target_2"
+    assert friedman.pvalue < 0.05
+    assert pairwise["significant_0.05"].all()
+    assert (tmp_path / "region_pair_coupling_group_summary.csv").is_file()
