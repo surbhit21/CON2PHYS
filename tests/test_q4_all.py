@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from CON2PHYS.src.Q4_final import participant_peak_metrics, summarize_across_participants
+from src.Q4_final import participant_peak_metrics, summarize_across_participants
 
 
 def test_peak_metric_and_paired_area_summary() -> None:
