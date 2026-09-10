@@ -52,6 +52,11 @@ else:
 
 LABEL_COLUMN = "variable_C"
 COMPLETED_LABELS = (0, 2)
+VARIABLE_LABELS = {
+    "A": ("variable_A", (0, 1)),
+    "B": ("variable_B", (0, 1)),
+    "C": ("variable_C", COMPLETED_LABELS),
+}
 EPOCHS = {
     "trial_start_to_stim": ("trial_start", "stim_start"),
     "stim_to_outcome": ("stim_start", "outcome"),
@@ -74,9 +79,9 @@ def stratified_train_val_test_split(
     y = np.asarray(labels)
     classes, counts = np.unique(y, return_counts=True)
     if len(classes) != 2:
-        raise ValueError("variable_C must contain exactly two completed-trial classes")
+        raise ValueError("the behavioral variable must contain exactly two classes")
     if counts.min() < 5:
-        raise ValueError("each variable_C class needs at least five trials")
+        raise ValueError("each behavioral class needs at least five trials")
 
     parts = [[], [], []]
     for cls in classes:
@@ -132,26 +137,28 @@ def _decode_participant(
     repeats: int,
     seed: int,
     c_grid: Sequence[float],
+    label_column: str = LABEL_COLUMN,
+    class_values: Sequence[int] = COMPLETED_LABELS,
 ) -> list[dict[str, int | float | str]]:
     session = load_session(participant, data_path=data_path, lfp_banks=(), load_spikes=True)
     if session.spikes is None:
         raise RuntimeError(f"participant {participant}: spikes were not loaded")
     table = session.trial_table
-    required = {LABEL_COLUMN, *(column for pair in EPOCHS.values() for column in pair)}
+    required = {label_column, *(column for pair in EPOCHS.values() for column in pair)}
     missing = required.difference(table.columns)
     if missing:
         raise ValueError(f"participant {participant}: missing columns {sorted(missing)}")
 
-    completed = table[LABEL_COLUMN].isin(COMPLETED_LABELS).to_numpy()
+    completed = table[label_column].isin(class_values).to_numpy()
     epoch_data = {}
     valid_all = completed.copy()
     for epoch, (start, end) in EPOCHS.items():
         rates, valid = epoch_firing_rates(session.spikes, table, start, end)
         epoch_data[epoch] = rates
         valid_all &= valid
-    labels_original = table.loc[valid_all, LABEL_COLUMN].to_numpy()
-    # Map 0/2 to the consecutive targets expected by binary metrics.
-    labels = (labels_original == COMPLETED_LABELS[1]).astype(int)
+    labels_original = table.loc[valid_all, label_column].to_numpy()
+    # Map the selected values to consecutive binary targets.
+    labels = (labels_original == class_values[1]).astype(int)
     epoch_data = {name: values[valid_all] for name, values in epoch_data.items()}
 
     records: list[dict[str, int | float | str]] = []
@@ -173,6 +180,7 @@ def _decode_participant(
             records.append(
                 {
                     "participant": participant,
+                    "variable": label_column,
                     "repeat": repeat,
                     "epoch": epoch,
                     "accuracy": accuracy_score(labels[test], prediction),
@@ -209,6 +217,41 @@ def decode_variable_c(
         raise ValueError("no participants were selected")
     chunks = Parallel(n_jobs=n_jobs)(
         delayed(_decode_participant)(p, data_path, repeats, seed, c_grid) for p in selected
+    )
+    return pd.DataFrame(row for chunk in chunks for row in chunk)
+
+
+def decode_behavioral_variable(
+    variable: str,
+    *,
+    data_path: str | os.PathLike[str] = DEFAULT_DATA_PATH,
+    participants: Sequence[int] | None = None,
+    repeats: int = 10,
+    seed: int = 12345,
+    c_grid: Sequence[float] = DEFAULT_C_GRID,
+    n_jobs: int = 1,
+) -> pd.DataFrame:
+    """Decode A, B, or C using the same participant-specific epoch analysis."""
+    key = variable.upper()
+    if key not in VARIABLE_LABELS:
+        raise ValueError("variable must be A, B, or C")
+    if key == "C":
+        return decode_variable_c(data_path=data_path, participants=participants,
+                                 repeats=repeats, seed=seed, c_grid=c_grid,
+                                 n_jobs=n_jobs)
+    if repeats < 1 or n_jobs == 0:
+        raise ValueError("repeats must be positive and n_jobs must not be zero")
+    if not c_grid or any(not np.isfinite(c) or c <= 0 for c in c_grid):
+        raise ValueError("all c_grid values must be positive and finite")
+    selected = list(available_subjects(data_path) if participants is None else participants)
+    if not selected:
+        raise ValueError("no participants were selected")
+    label_column, class_values = VARIABLE_LABELS[key]
+    chunks = Parallel(n_jobs=n_jobs)(
+        delayed(_decode_participant)(
+            p, data_path, repeats, seed, c_grid, label_column, class_values
+        )
+        for p in selected
     )
     return pd.DataFrame(row for chunk in chunks for row in chunk)
 
@@ -323,7 +366,10 @@ def plot_results(results: pd.DataFrame, output_path: str | os.PathLike[str]) -> 
     ax.set_xticks(x, [name.replace("_", "\n") for name in EPOCHS])
     ax.set_ylabel("Held-out balanced accuracy")
     ax.set_ylim(0, 1)
-    ax.set_title("Decoding variable C from complete trial epochs")
+    variable = "behavioral variable"
+    if "variable" in results and results["variable"].nunique() == 1:
+        variable = str(results["variable"].iloc[0]).replace("variable_", "variable ")
+    ax.set_title(f"Decoding {variable} from complete trial epochs")
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -384,7 +430,10 @@ def plot_mean_decoding_metrics(
     ax.set_xticks(x, [name.replace("_", "\n") for name in EPOCHS])
     ax.set_ylabel("Mean held-out decoding score")
     ax.set_ylim(0, 1)
-    ax.set_title("Variable C decoding by trial epoch (mean and 95% CI)")
+    variable = "behavioral variable"
+    if "variable" in results and results["variable"].nunique() == 1:
+        variable = str(results["variable"].iloc[0]).replace("variable_", "variable ")
+    ax.set_title(f"{variable.title()} decoding by trial epoch (mean and 95% CI)")
     ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -417,15 +466,22 @@ def summarize_decoding_metrics(results: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--participants", type=int, nargs="+")
+    parser.add_argument("--variable", choices=("A", "B", "C"), default="C")
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = DEFAULT_OUTPUT_PATH if args.variable == "C" else (
+            DEFAULT_OUTPUT_PATH.parent / f"Q12_{args.variable}_decoding"
+        )
     args.output.mkdir(parents=True, exist_ok=True)
-    results = decode_variable_c(data_path=args.data_path, participants=args.participants,
-                                repeats=args.repeats, seed=args.seed, n_jobs=args.n_jobs)
+    results = decode_behavioral_variable(
+        args.variable, data_path=args.data_path, participants=args.participants,
+        repeats=args.repeats, seed=args.seed, n_jobs=args.n_jobs
+    )
     summary, comparisons = summarize_results(results)
     results.to_csv(args.output / "test_scores.csv", index=False)
     summary.to_csv(args.output / "epoch_summary.csv", index=False)
