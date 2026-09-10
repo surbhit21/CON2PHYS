@@ -19,6 +19,8 @@ import matplotlib
 from scipy.stats import friedmanchisquare, linregress, ttest_rel
 from scipy.stats import t as student_t
 from scipy.stats import ttest_1samp
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE, trustworthiness
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -47,6 +49,8 @@ VARIANCE_THRESHOLD = 0.95
 TRAIN_FRACTION = 0.50
 RANDOM_SEED = 13
 N_SHUFFLES = 20
+MANIFOLD_MAX_SAMPLES = 3000
+MANIFOLD_N_NEIGHBORS = 15
 DEFAULT_VARIANCE_PLOT = DEFAULT_PLOT_PATH / "Q13_pca_explained_variance.png"
 DEFAULT_PARTICIPANT_RESULTS = DEFAULT_PLOT_PATH / "Q13_pca_by_participant.csv"
 DEFAULT_GROUP_SUMMARY = DEFAULT_PLOT_PATH / "Q13_pca_group_summary.csv"
@@ -58,6 +62,8 @@ DEFAULT_MATCHED_PLOT = DEFAULT_PLOT_PATH / "Q13_pca_matched_group_summary.png"
 DEFAULT_PARTICIPATION_TESTS = (
     DEFAULT_PLOT_PATH / "Q13_pca_matched_participation_ratio_tests.csv"
 )
+DEFAULT_MANIFOLD_RESULTS = DEFAULT_PLOT_PATH / "Q13_manifold_comparison.csv"
+DEFAULT_MANIFOLD_PLOT = DEFAULT_PLOT_PATH / "Q13_manifold_comparison.png"
 
 
 def load_participant_1_spikes() -> CON2PHYSSession:
@@ -405,6 +411,127 @@ def plot_variance_spectra(
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(figure)
+
+
+def nonlinear_embedding_comparison(
+    firing_rates: np.ndarray,
+    *,
+    max_samples: int = MANIFOLD_MAX_SAMPLES,
+    random_seed: int = RANDOM_SEED,
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Compare 2-D PCA, UMAP, and t-SNE on identical sampled observations.
+
+    Trustworthiness quantifies local-neighborhood preservation from the full
+    neural space. UMAP and t-SNE have no explained-variance spectrum, so this
+    complements rather than replaces PCA's 95%-variance dimensionality.
+    """
+    values = np.asarray(firing_rates, dtype=float)
+    if values.ndim != 2 or min(values.shape) < 2:
+        raise ValueError("firing_rates must contain at least two bins and neurons")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("firing_rates must be finite")
+    if max_samples < 3:
+        raise ValueError("max_samples must be at least three")
+
+    rng = np.random.default_rng(random_seed)
+    if len(values) > max_samples:
+        sample = np.sort(rng.choice(len(values), size=max_samples, replace=False))
+        values = values[sample]
+
+    try:
+        import umap
+    except ImportError as error:
+        raise ImportError(
+            "UMAP comparison requires 'umap-learn'; install project requirements"
+        ) from error
+
+    # sklearn's trustworthiness requires n_neighbors < n_samples / 2.
+    n_neighbors = min(MANIFOLD_N_NEIGHBORS, max(1, (len(values) - 1) // 2))
+    perplexity = min(30.0, max(1.0, (len(values) - 1) / 3.0))
+    embeddings = {
+        "PCA": PCA(n_components=2).fit_transform(values),
+        "UMAP": umap.UMAP(
+            n_components=2,
+            n_neighbors=n_neighbors,
+            random_state=random_seed,
+        ).fit_transform(values),
+        "t-SNE": TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            init="pca",
+            learning_rate="auto",
+            random_state=random_seed,
+        ).fit_transform(values),
+    }
+    scores = {
+        method: float(trustworthiness(values, embedding, n_neighbors=n_neighbors))
+        for method, embedding in embeddings.items()
+    }
+    return embeddings, scores
+
+
+def participant_manifold_comparison(
+    participant: int = PARTICIPANT,
+    *,
+    max_samples: int = MANIFOLD_MAX_SAMPLES,
+    path=DEFAULT_MANIFOLD_PLOT,
+) -> pd.DataFrame:
+    """Plot PCA/UMAP/t-SNE embeddings and score them for each brain region."""
+    session = load_participant_spikes(participant)
+    if session.spikes is None:
+        raise ValueError(f"participant {participant} has no spike data")
+    metadata = session.spikes.metadata
+    epochs = stimulus_to_outcome_epochs(session.trial_table)
+    train_epochs, test_epochs = split_epochs_half(
+        epochs, random_seed=RANDOM_SEED + participant
+    )
+    figure, axes = plt.subplots(
+        len(BRAIN_REGIONS), 3, figsize=(12, 11), constrained_layout=True
+    )
+    records: list[dict[str, float | int | str]] = []
+
+    for row, region in enumerate(BRAIN_REGIONS):
+        unit_ids = metadata.index[metadata["brain_area"] == region].astype(int).tolist()
+        train_counts = sliding_spike_counts(session.spikes, train_epochs, unit_ids)
+        test_counts = sliding_spike_counts(session.spikes, test_epochs, unit_ids)
+        train_rates, test_rates, retained = normalized_firing_rates(
+            train_counts, test_counts
+        )
+        rates = np.vstack((train_rates, test_rates))
+        embeddings, scores = nonlinear_embedding_comparison(
+            rates,
+            max_samples=max_samples,
+            random_seed=RANDOM_SEED + participant * 100 + region,
+        )
+        for column, method in enumerate(("PCA", "UMAP", "t-SNE")):
+            embedding = embeddings[method]
+            axes[row, column].scatter(
+                embedding[:, 0], embedding[:, 1], s=3, alpha=0.35,
+                c=np.arange(len(embedding)), cmap="viridis", rasterized=True,
+            )
+            axes[row, column].set_title(
+                f"Region {region}: {method}\ntrustworthiness={scores[method]:.3f}"
+            )
+            axes[row, column].set_xticks([])
+            axes[row, column].set_yticks([])
+            records.append(
+                {
+                    "participant": participant,
+                    "brain_region": region,
+                    "method": method,
+                    "n_neurons_used": int(retained.sum()),
+                    "n_samples": len(embedding),
+                    "trustworthiness": scores[method],
+                }
+            )
+
+    figure.suptitle(
+        "Linear and nonlinear embeddings (colour follows sampled-window order)"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return pd.DataFrame.from_records(records)
 
 
 def participant_pca(
@@ -812,6 +939,8 @@ def all_participants_pca(
 
 def main() -> None:
     _, summary = all_participants_pca(match_neurons_and_trials=True)
+    manifold_results = participant_manifold_comparison()
+    manifold_results.to_csv(DEFAULT_MANIFOLD_RESULTS, index=False)
     print(
         f"\nCross-validated PCA of training-normalized firing rates in "
         f"{BIN_SIZE_S * 1000:g}-ms windows stepped by "
@@ -824,6 +953,8 @@ def main() -> None:
     print(f"Matched group summary: {DEFAULT_MATCHED_SUMMARY}")
     print(f"Matched group plot: {DEFAULT_MATCHED_PLOT}")
     print(f"Participation-ratio tests: {DEFAULT_PARTICIPATION_TESTS}")
+    print(f"PCA/UMAP/t-SNE comparison: {DEFAULT_MANIFOLD_RESULTS}")
+    print(f"PCA/UMAP/t-SNE plot: {DEFAULT_MANIFOLD_PLOT}")
 
 
 if __name__ == "__main__":

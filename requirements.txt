@@ -43,5 +43,6 @@ threadpoolctl==3.6.0
 tomli==2.4.1
 torch==2.12.1
 typing_extensions==4.16.0
+umap-learn==0.5.9.post2
 tzdata==2026.3
 xarray==2025.6.1
